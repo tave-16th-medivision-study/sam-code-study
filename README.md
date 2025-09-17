@@ -1,2 +1,3 @@
-# sam-study
-Code Study for SAM(segment anything) Paper 
+# SAM(Segment Anything Model) Code Study
+
+Code study for SAM, from paper "Segment Anything (ICCV 2023)". 
