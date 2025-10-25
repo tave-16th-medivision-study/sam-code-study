@@ -1,4 +1,4 @@
-## SAM Commenting by Huigyoeng
+## SAM Commenting 
 
 ### Commented Files 
 
