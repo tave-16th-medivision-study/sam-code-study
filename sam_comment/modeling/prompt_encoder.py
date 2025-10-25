@@ -12,7 +12,9 @@ from typing import Any, Optional, Tuple, Type
 
 from .common import LayerNorm2d
 
-
+# recap : prompt 인코더에서는 sam의 마스크 디코더에 넣은 프롬프트(점/박스 등)을 임베딩으로 변환해줍니다
+# sparse(점/박스) 임베딩: (B, N, embed_dim)
+# dense(마스크) 임베딩: (B, embed_dim, H_embed, W_embed)
 class PromptEncoder(nn.Module):
     def __init__(
         self,
@@ -38,15 +40,17 @@ class PromptEncoder(nn.Module):
         """
         super().__init__()
         self.embed_dim = embed_dim
-        self.input_image_size = input_image_size
-        self.image_embedding_size = image_embedding_size
+        self.input_image_size = input_image_size                # 원본(패딩된) 입력 이미지 크기 (H_in, W_in)
+        self.image_embedding_size = image_embedding_size        # 이미지 인코더 출력 크기 (H_embed, W_embed)
         self.pe_layer = PositionEmbeddingRandom(embed_dim // 2)
 
+        # 점/박스 프롬프트 유형별 가중치 임베딩 (pos, neg, box_corner1, box_corner2)
         self.num_point_embeddings: int = 4  # pos/neg point + 2 box corners
         point_embeddings = [nn.Embedding(1, embed_dim) for i in range(self.num_point_embeddings)]
         self.point_embeddings = nn.ModuleList(point_embeddings)
         self.not_a_point_embed = nn.Embedding(1, embed_dim)
 
+         # 마스크 입력은 이미지 임베딩보다 4배 큰 해상도로 가정 → 1/2, 1/2 다운스케일 후 1x1로 채널 정렬
         self.mask_input_size = (4 * image_embedding_size[0], 4 * image_embedding_size[1])
         self.mask_downscaling = nn.Sequential(
             nn.Conv2d(1, mask_in_chans // 4, kernel_size=2, stride=2),
@@ -55,10 +59,11 @@ class PromptEncoder(nn.Module):
             nn.Conv2d(mask_in_chans // 4, mask_in_chans, kernel_size=2, stride=2),
             LayerNorm2d(mask_in_chans),
             activation(),
-            nn.Conv2d(mask_in_chans, embed_dim, kernel_size=1),
+            nn.Conv2d(mask_in_chans, embed_dim, kernel_size=1),    # 채널을 embed_dim으로 정렬
         )
         self.no_mask_embed = nn.Embedding(1, embed_dim)
 
+    # 이미지 임베딩 해상도(H_embed, W_embed)에 맞는 dense positional encoding 반환.
     def get_dense_pe(self) -> torch.Tensor:
         """
         Returns the positional encoding used to encode point prompts,
@@ -77,13 +82,15 @@ class PromptEncoder(nn.Module):
         pad: bool,
     ) -> torch.Tensor:
         """Embeds point prompts."""
-        points = points + 0.5  # Shift to center of pixel
+        points = points + 0.5  # Shift to center of pixel :픽셀 중심 정렬(정수좌표 → 센터 기준)
         if pad:
+            # 박스가 없을 때 포인트 시퀀스 끝에 패딩 포인트 추가 (박스/포인트 수 맞추기용)
             padding_point = torch.zeros((points.shape[0], 1, 2), device=points.device)
             padding_label = -torch.ones((labels.shape[0], 1), device=labels.device)
             points = torch.cat([points, padding_point], dim=1)
             labels = torch.cat([labels, padding_label], dim=1)
         point_embedding = self.pe_layer.forward_with_coords(points, self.input_image_size)
+        # 라벨에 따라 타입 임베딩을 더해 타입 구분 (masking 포함)
         point_embedding[labels == -1] = 0.0
         point_embedding[labels == -1] += self.not_a_point_embed.weight
         point_embedding[labels == 0] += self.point_embeddings[0].weight
@@ -92,6 +99,7 @@ class PromptEncoder(nn.Module):
 
     def _embed_boxes(self, boxes: torch.Tensor) -> torch.Tensor:
         """Embeds box prompts."""
+        # 박스 프롬프트를 두 코너(좌상, 우하) 좌표 PE + 코너 타입 임베딩으로 변환.
         boxes = boxes + 0.5  # Shift to center of pixel
         coords = boxes.reshape(-1, 2, 2)
         corner_embedding = self.pe_layer.forward_with_coords(coords, self.input_image_size)
@@ -101,6 +109,7 @@ class PromptEncoder(nn.Module):
 
     def _embed_masks(self, masks: torch.Tensor) -> torch.Tensor:
         """Embeds mask inputs."""
+        # 마스크 프롬프트를 다운스케일 + 정규화 + 채널정렬로 dense 임베딩 생성.
         mask_embedding = self.mask_downscaling(masks)
         return mask_embedding
 
@@ -131,6 +140,10 @@ class PromptEncoder(nn.Module):
         boxes: Optional[torch.Tensor],
         masks: Optional[torch.Tensor],
     ) -> Tuple[torch.Tensor, torch.Tensor]:
+        # 세 종류의 프롬프트(점/박스/마스크)를 각각 임베딩하고,
+        # sparse_embeddings: 점+박스 (B, N_total, embed_dim)
+        # dense_embeddings : 마스크 (B, embed_dim, H_embed, W_embed)
+        # 형태로 반환
         """
         Embeds different types of prompts, returning both sparse and dense
         embeddings.
@@ -168,6 +181,8 @@ class PromptEncoder(nn.Module):
         return sparse_embeddings, dense_embeddings
 
 
+# Random Fourier Features
+# 2D 좌표(x, y)를 고차원 임베딩 벡터로 변환해주고 이를 토대로 모델이 공간적 위치 정보를 학습할 수 있게 함.
 class PositionEmbeddingRandom(nn.Module):
     """
     Positional encoding using random spatial frequencies.
@@ -193,17 +208,20 @@ class PositionEmbeddingRandom(nn.Module):
 
     def forward(self, size: Tuple[int, int]) -> torch.Tensor:
         """Generate positional encoding for a grid of the specified size."""
-        h, w = size
+        h, w = size    # (H,w) 크기의 grid에 대해 positional encoding
         device: Any = self.positional_encoding_gaussian_matrix.device
         grid = torch.ones((h, w), device=device, dtype=torch.float32)
         y_embed = grid.cumsum(dim=0) - 0.5
         x_embed = grid.cumsum(dim=1) - 0.5
+        # [0,1] 정규화
         y_embed = y_embed / h
         x_embed = x_embed / w
-
+        # 2D 좌표 맵 (H, W, 2)
         pe = self._pe_encoding(torch.stack([x_embed, y_embed], dim=-1))
         return pe.permute(2, 0, 1)  # C x H x W
 
+    # 이미지 좌표를 입력으로 받아서 정규화 한 후 positional encoding으로 변환
+    # SAM 에서 point prompt 좌표 (x,y)를 임베딩 함함
     def forward_with_coords(
         self, coords_input: torch.Tensor, image_size: Tuple[int, int]
     ) -> torch.Tensor:
